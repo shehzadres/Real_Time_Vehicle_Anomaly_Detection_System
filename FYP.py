@@ -1,218 +1,224 @@
+"""
+FYP.py
+State-based traffic anomaly detection pipeline
+Supports SPEEDING, STALLED, WRONG WAY, LANE VIOL
+Optimized for ~1 minute videos
+"""
 
-
-import argparse
 import cv2
 import numpy as np
-import imutils
+from collections import defaultdict, deque
 from ultralytics import YOLO
-import easyocr
-import pytesseract
-import re
-import time
-from pathlib import Path
-from PIL import Image
-import os
-from pathlib import Path
+import supervision as sv
+
+# --------------------------------------------------
+# INITIALIZATION
+# --------------------------------------------------
+def initialize_pipeline(config: dict):
+    # ---------------- CONFIG ----------------
+    fps = config.get("fps", 25)
+
+    vehicle_model_path = config.get("vehicle_model_path", "yolo11s.pt")
+    vehicle_classes = config.get("vehicle_classes", [2, 3, 5, 7])
+
+    road_length_m = config.get("road_length_m", 20.0)
+    road_width_m = config.get("road_width_m", 10.0)
+    lane_divisions = config.get("lane_divisions", 3)
+
+    speed_limit_kmh = config.get("speed_limit_kmh", 30)
+    smooth_window = config.get("speed_smoothing_window", 10)
+    consec_speeding_frames = config.get("speeding_consec_frames", 6)
+
+    stall_seconds = config.get("stall_seconds", 3)
+    stall_speed_thresh = config.get("stall_speed_thresh", 0.5)
+
+    lane_violation_seconds = config.get("lane_violation_seconds", 0.5)
+    lane_direction = config.get(
+        "lane_direction",
+        {lane: +1 for lane in range(lane_divisions)}
+    )
+
+    homography_src = config.get("homography_src", None)
+
+    # ---------------- MODELS ----------------
+    vehicle_model = YOLO(vehicle_model_path)
+
+    tracker = sv.ByteTrack()
+    box_annotator = sv.BoxAnnotator(thickness=1)
+    label_annotator = sv.LabelAnnotator(text_scale=0.3)
+    trace_annotator = sv.TraceAnnotator(thickness=1)
+
+    # ---------------- STATE ----------------
+    state = {
+        # Models & tools
+        "vehicle_model": vehicle_model,
+        "vehicle_classes": vehicle_classes,
+        "tracker": tracker,
+        "box_annotator": box_annotator,
+        "label_annotator": label_annotator,
+        "trace_annotator": trace_annotator,
+
+        # Geometry
+        "homography": None,
+        "homography_src": homography_src,
+        "road_length": road_length_m,
+        "road_width": road_width_m,
+        "lane_divisions": lane_divisions,
+
+        # Timing
+        "fps": fps,
+        "frame_idx": 0,
+
+        # Motion
+        "prev_positions": {},
+
+        # Speed logic
+        "speed_limit": speed_limit_kmh,
+        "speed_history": defaultdict(lambda: deque(maxlen=smooth_window)),
+        "consec_speeding": defaultdict(int),
+        "consec_speeding_frames": consec_speeding_frames,
+
+        # Stall logic
+        "stall_frames": int(stall_seconds * fps),
+        "stall_speed_thresh": stall_speed_thresh,
+        "stalled_counter": defaultdict(int),
+
+        # Lane logic
+        "vehicle_lane": {},
+        "lane_change_counter": defaultdict(int),
+        "lane_violation_frames": int(lane_violation_seconds * fps),
+
+        # Direction
+        "lane_direction": lane_direction
+    }
+
+    return state
 
 
-DESKTOP = Path.home() / "Desktop"
-DEFAULT_IMAGE_PATH = DESKTOP / "car.jpg"  
 
+# --------------------------------------------------
+# FRAME PROCESSING
+# --------------------------------------------------
+def process_frame(frame, state):
+    model = state["vehicle_model"]
+    tracker = state["tracker"]
 
-# ---------------------------
-# Configuration
-# ---------------------------
-YOLO_MODEL = "yolov12s.pt"   
-DETECTION_CONFIDENCE = 0.25
-OCR_LANGS = ["en"]          
-USE_PYTESSERACT_FALLBACK = False
+    # -------- Homography init (once) --------
+    if state["homography"] is None:
+        h, w = frame.shape[:2]
+        src = np.array([[100, h-50], [w-100, h-50],
+                        [w-100, 50], [100, 50]], dtype=np.float32)
+        dst = np.array([[0, 0],
+                        [state["road_width"], 0],
+                        [state["road_width"], state["road_length"]],
+                        [0, state["road_length"]]], dtype=np.float32)
+        state["homography"] = cv2.getPerspectiveTransform(src, dst)
 
+    # -------- Detection & Tracking --------
+    results = model.track(frame, persist=True, classes=[2,3,5,7], verbose=False)[0]
+    detections = sv.Detections.from_ultralytics(results)
+    detections = tracker.update_with_detections(detections)
 
-PLATE_REGEX = r"[A-Z0-9\-]{4,12}"
+    anomalies = []
+    labels = []
+    curr_positions = {}
 
+    lane_width = state["road_width"] / state["lane_divisions"]
 
-# ---------------------------
-# Helper functions
-# ---------------------------
-def load_detector(model_path=YOLO_MODEL):
-    """Load YOLO model (Ultralytics)."""
-    print(f"[INFO] Loading detector model: {model_path}")
-    model = YOLO(model_path)
-    return model
+    if detections.tracker_id is not None:
+        for i, tid in enumerate(detections.tracker_id):
+            x1, y1, x2, y2 = map(int, detections.xyxy[i])
+            cx, cy = int((x1+x2)/2), int(y2)
 
+            pt = np.array([[[cx, cy]]], dtype=np.float32)
+            world = cv2.perspectiveTransform(pt, state["homography"])[0][0]
+            curr_positions[tid] = world
 
-def detect_plates(model, image: np.ndarray, conf_thresh=DETECTION_CONFIDENCE):
-    """
-    Run detector on image and return list of bounding boxes (x1,y1,x2,y2) and confidences.
-    Assumes model returns boxes in xyxy format.
-    """
-    # ultralytics YOLO model returns results with .boxes.xyxy numpy array
-    results = model.predict(source=image, conf=conf_thresh, verbose=False)  # single image
-    bboxes = []
-    # model.predict returns list-like results (for each image)
-    if len(results) == 0:
-        return bboxes
-    res = results[0]
-    boxes = getattr(res, "boxes", None)
-    if boxes is None:
-        return bboxes
-    for box in boxes:
-        xyxy = box.xyxy[0].cpu().numpy()  # [x1,y1,x2,y2]
-        conf = float(box.conf.cpu().numpy())
-        cls = int(box.cls.cpu().numpy()) if hasattr(box, "cls") else None
-        # NOTE: If using a general model, classes may vary. If you trained a plate-class-only model, fine.
-        bboxes.append((int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]), conf))
-    return bboxes
+            # ---------------- SPEED ----------------
+            speed = 0.0
+            if tid in state["prev_positions"]:
+                dist = np.linalg.norm(world - state["prev_positions"][tid])
+                speed = dist * state["fps"] * 3.6
 
+            state["speed_history"][tid].append(speed)
+            avg_speed = float(np.mean(state["speed_history"][tid]))
 
-def preprocess_plate(crop: np.ndarray):
-    """Preprocess cropped plate image for OCR: grayscale, adaptive thresholding, resize, denoise."""
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    scale = max(1, 400 // max(h, w))
-    if scale > 1:
-        gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 11, 2)
-    return th
+            if avg_speed > state["speed_limit"]:
+                state["consec_speeding"][tid] += 1
+            else:
+                state["consec_speeding"][tid] = 0
 
+            is_speeding = state["consec_speeding"][tid] >= state["consec_speeding_frames"]
 
-def ocr_easyocr(reader, image):
-    """Run EasyOCR on image and return best text candidate."""
-    result = reader.readtext(image, detail=0) 
-    if not result:
-        return ""
+            # ---------------- STALLED ----------------
+            if avg_speed < 0.5:
+                state["stalled_counter"][tid] += 1
+            else:
+                state["stalled_counter"][tid] = 0
 
-    combined = " ".join(result).upper()
-    m = re.search(PLATE_REGEX, combined)
-    if m:
-        return m.group(0)
-    tokens = sorted(result, key=lambda s: len(s), reverse=True)
-    return tokens[0].upper() if tokens else combined.upper()
+            is_stalled = state["stalled_counter"][tid] >= state["stall_frames"]
 
+            # ---------------- LANE ----------------
+            lane_num = int(world[0] // lane_width)
+            if lane_num < 0 or lane_num >= state["lane_divisions"]:
+                lane_num = None
 
-def ocr_tesseract(image):
-    """Fallback OCR via pytesseract (image should be grayscale or PIL)."""
-    if isinstance(image, np.ndarray):
-        pil = Image.fromarray(image)
-    else:
-        pil = image
-    text = pytesseract.image_to_string(pil, config="--psm 7")
-    text = text.strip().upper()
-    m = re.search(PLATE_REGEX, text)
-    return m.group(0) if m else text
+            prev_lane = state["vehicle_lane"].get(tid)
+            is_lane_violation = False
 
+            if prev_lane is None:
+                state["vehicle_lane"][tid] = lane_num
+            else:
+                if lane_num != prev_lane and lane_num is not None:
+                    state["lane_change_counter"][tid] += 1
+                else:
+                    state["lane_change_counter"][tid] = 0
 
-def postprocess_text(text: str):
-    """Clean OCR text: remove unwanted chars and keep alnum + dash."""
-    if not text:
-        return ""
-    cleaned = re.sub(r"[^A-Z0-9\-]", "", text.upper())
-    return cleaned
+                if state["lane_change_counter"][tid] >= state["lane_violation_frames"]:
+                    is_lane_violation = True
+                    state["vehicle_lane"][tid] = lane_num
+                    state["lane_change_counter"][tid] = 0
 
+            # ---------------- WRONG WAY ----------------
+            is_wrong_way = False
+            if tid in state["prev_positions"] and lane_num is not None:
+                dy = world[1] - state["prev_positions"][tid][1]
+                correct_dir = state["lane_direction"].get(lane_num, +1)
+                if dy * correct_dir < 0:
+                    is_wrong_way = True
 
-# ---------------------------
-# Main detection + OCR pipeline
-# ---------------------------
-def process_image_file(model, reader, img_path: str, visualize=True):
-    img = cv2.imread(img_path)
-    if img is None:
-        raise ValueError(f"Could not open image {img_path}")
-    return process_frame(model, reader, img, visualize=visualize)
+            # ---------------- LABEL ----------------
+            label = f"#{tid} {avg_speed:.1f} km/h"
+            if is_speeding: label += " [SPEEDING]"
+            if is_stalled: label += " [STALLED]"
+            if is_wrong_way: label += " [WRONG WAY]"
+            if is_lane_violation: label += " [LANE VIOL]"
+            labels.append(label)
 
+            # ---------------- LOG ANOMALIES ----------------
+            def log(event):
+                anomalies.append({
+                    "timestamp_s": round(state["frame_idx"] / state["fps"], 2),
+                    "frame_idx": state["frame_idx"],
+                    "tracker_id": tid,
+                    "event": event,
+                    "speed_kmh": round(avg_speed, 1),
+                    "plate_text": "",
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2
+                })
 
-def process_frame(model, reader, frame: np.ndarray, visualize=True):
-    """
-    Detect plates in frame, OCR them, and optionally annotate and return annotated frame and results.
-    Returns:
-      annotated_frame, results_list
-    where results_list is list of dicts: {'bbox':(x1,y1,x2,y2), 'conf':float, 'text':str}
-    """
-    orig = frame.copy()
-    # resize for faster detection (optional)
-    frame_small = imutils.resize(frame, width=1280)
-    bboxes = detect_plates(model, frame_small)
-    results = []
-    for (x1, y1, x2, y2, conf) in bboxes:
-        # crop with padding
-        pad = int(0.03 * (x2 - x1 + y2 - y1) / 2)
-        x1p = max(0, x1 - pad)
-        y1p = max(0, y1 - pad)
-        x2p = min(frame_small.shape[1] - 1, x2 + pad)
-        y2p = min(frame_small.shape[0] - 1, y2 + pad)
-        crop = frame_small[y1p:y2p, x1p:x2p]
-        if crop.size == 0:
-            continue
-        prep = preprocess_plate(crop)
-        # Try easyocr
-        text = ocr_easyocr(reader, prep)
-        if (not text or len(text) < 2) and USE_PYTESSERACT_FALLBACK:
-            text = ocr_tesseract(prep)
-        text = postprocess_text(text)
-        results.append({"bbox": (x1p, y1p, x2p, y2p), "conf": conf, "text": text})
-        # annotate
-        if visualize:
-            cv2.rectangle(frame_small, (x1p, y1p), (x2p, y2p), (0, 255, 0), 2)
-            label = f"{text} {conf:.2f}"
-            cv2.putText(frame_small, label, (x1p, max(0, y1p-10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-    return frame_small, results
+            if is_speeding: log("SPEEDING")
+            if is_stalled: log("STALLED")
+            if is_wrong_way: log("WRONG WAY")
+            if is_lane_violation: log("LANE VIOL")
 
+    # -------- Update state --------
+    state["prev_positions"] = curr_positions
+    state["frame_idx"] += 1
 
-# ---------------------------
-# CLI and video loop
-# ---------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--image", default=str(DEFAULT_IMAGE_PATH), help="Path to input image")
-    ap.add_argument("--video", help="Path to input video file")
-    ap.add_argument("--webcam", type=int, help="Webcam device index (0 etc.)")
-    ap.add_argument("--weights", default=YOLO_MODEL, help="YOLO weights path")
-    args = ap.parse_args()
+    # -------- Annotate --------
+    frame = state["trace_annotator"].annotate(frame, detections)
+    frame = state["box_annotator"].annotate(frame, detections)
+    frame = state["label_annotator"].annotate(frame, detections, labels)
 
-    model = load_detector(args.weights)
-    reader = easyocr.Reader(OCR_LANGS, gpu=False) 
-
-    if args.image:
-        out_img, results = process_image_file(model, reader, args.image, visualize=True)
-        print("[RESULTS]")
-        for r in results:
-            print(r)
-        cv2.imshow("Plates", out_img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-        out_path = Path(args.image).with_name(Path(args.image).stem + "_annotated.jpg")
-        cv2.imwrite(str(out_path), out_img)
-        print(f"Annotated image saved to {out_path}")
-
-    elif args.video or args.webcam is not None:
-        if args.video:
-            cap = cv2.VideoCapture(args.video)
-        else:
-            cap = cv2.VideoCapture(args.webcam)
-        if not cap.isOpened():
-            print("[ERROR] Could not open video source")
-            return
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        print("[INFO] Starting video loop. Press 'q' to quit.")
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            annotated, results = process_frame(model, reader, frame, visualize=True)
-            if results:
-                for r in results:
-                    print(f"Detected: {r['text']}, conf={r['conf']:.2f}, bbox={r['bbox']}")
-            cv2.imshow("Plate Reader", annotated)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-        cap.release()
-        cv2.destroyAllWindows()
-    else:
-        print("Provide --image or --video or --webcam. See --help.")
-
-
-if __name__ == "__main__":
-    main()
+    return frame, anomalies, state
